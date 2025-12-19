@@ -15,6 +15,7 @@
 #include <driver/spi_common.h>
 #include <esp_lcd_panel_io.h>
 #include <esp_lcd_panel_ops.h>
+#include <esp_timer.h>
 
 #include "power_save_timer.h"
 #include "../zhengchen-1.54tft-wifi/power_manager.h"
@@ -77,6 +78,18 @@ private:
     esp_lcd_panel_handle_t panel = nullptr;
     uint32_t touch_value = 0;
     uint32_t touch_value1 = 0;
+    // Touch guard variables
+    uint64_t touch_start_time_us_ = 0;
+    int touch_consec0_ = 0;
+    int touch_consec1_ = 0;
+    uint64_t next_allow_trigger0_us_ = 0;
+    uint64_t next_allow_trigger1_us_ = 0;
+
+    // Touch configuration
+    static constexpr uint32_t kTouchThreshold = 30000;           // 保持原阈值
+    static constexpr int kConsecutiveRequired = 3;               // 需要连续满足的次数
+    static constexpr uint64_t kTouchCooldownMs = 3000;           // 单通道触发冷却期
+    static constexpr uint64_t kStartupSuppressMs = 10000;        // 上电后抑制触发时长
 
 
     void InitializePowerManager() {
@@ -113,26 +126,55 @@ private:
         touch_pad_set_fsm_mode(TOUCH_FSM_MODE_TIMER); // 设置 FSM 模式为定时器模式
         touch_pad_fsm_start();
         vTaskDelay(40 / portTICK_PERIOD_MS);
+        // 记录启动时间，用于抑制上电瞬态误触发
+        touch_start_time_us_ = esp_timer_get_time();
+        next_allow_trigger0_us_ = 0;
+        next_allow_trigger1_us_ = 0;
+        touch_consec0_ = 0;
+        touch_consec1_ = 0;
     }
 
     static void touch_read_task(void* arg) {
         zhengchen_eye* self = static_cast<zhengchen_eye*>(arg);
         auto& app = Application::GetInstance();
         while (1) {
-            touch_pad_read_raw_data(TOUCH_PAD_NUM4, &self->touch_value);
-            touch_pad_read_raw_data(TOUCH_PAD_NUM5, &self->touch_value1);
-            if (self->touch_value > 30000) {
-                if (app.GetDeviceState() == kDeviceStateIdle) {
-                    app.WakeWordInvoke("(正在抚摸你的头，请提供相关的情绪价值，回答)");
-                }
+            // 启动后的抑制期，防止上电抖动导致误触发
+            uint64_t now_us = esp_timer_get_time();
+            if (now_us - self->touch_start_time_us_ < kStartupSuppressMs * 1000ULL) {
+                vTaskDelay(200 / portTICK_PERIOD_MS);
+                continue;
             }
 
-            if (self->touch_value1 > 30000) {
-                if (app.GetDeviceState() == kDeviceStateIdle) {
-                    app.WakeWordInvoke("(正在抚摸你的身体，请提供相关的情绪价值，回答)");
-                }
+            touch_pad_read_raw_data(TOUCH_PAD_NUM4, &self->touch_value);
+            touch_pad_read_raw_data(TOUCH_PAD_NUM5, &self->touch_value1);
+            // 触发判定：需要连续满足阈值，且满足冷却期
+            bool can_invoke = (app.GetDeviceState() == kDeviceStateIdle);
+
+            // 通道0（头部）
+            if (self->touch_value > kTouchThreshold) {
+                self->touch_consec0_++;
+            } else {
+                self->touch_consec0_ = 0;
             }
-            vTaskDelay(500 / portTICK_PERIOD_MS);
+            if (can_invoke && self->touch_consec0_ >= kConsecutiveRequired && now_us >= self->next_allow_trigger0_us_) {
+                app.WakeWordInvoke("(正在抚摸你的头，请提供相关的情绪价值，回答)");
+                self->next_allow_trigger0_us_ = now_us + kTouchCooldownMs * 1000ULL;
+                self->touch_consec0_ = 0;
+            }
+
+            // 通道1（身体）
+            if (self->touch_value1 > kTouchThreshold) {
+                self->touch_consec1_++;
+            } else {
+                self->touch_consec1_ = 0;
+            }
+            if (can_invoke && self->touch_consec1_ >= kConsecutiveRequired && now_us >= self->next_allow_trigger1_us_) {
+                app.WakeWordInvoke("(正在抚摸你的身体，请提供相关的情绪价值，回答)");
+                self->next_allow_trigger1_us_ = now_us + kTouchCooldownMs * 1000ULL;
+                self->touch_consec1_ = 0;
+            }
+
+            vTaskDelay(100 / portTICK_PERIOD_MS);
         }
     }
    
